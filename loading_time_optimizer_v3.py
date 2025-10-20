@@ -5,7 +5,6 @@
 """
 import pandas as pd
 from typing import List, Dict, Tuple, Set
-import copy
 
 
 class LoadingPoint:
@@ -106,82 +105,60 @@ class LoadingTimeOptimizerV3:
             key=lambda x: -self.vehicle_speeds.get(x[0], 60.0)
         )
         
-        # 第一步：迭代为每辆车选择最优装货点（考虑已分配车辆的影响）
+        # 第一步：迭代为每辆车选择最优装货点（考虑预期排队影响）
         for vehicle_id, goods_ids in sorted_vehicles:
             if not goods_ids:
                 continue
-            
+
             vehicle_speed = self.vehicle_speeds.get(vehicle_id, 60.0)
-            
-            # 计算该车的总装货时间
-            total_loading_time = sum(self.goods_loading_time.get(gid, 0) for gid in goods_ids)
-            
-            # 评估每个装货点（考虑预期排队时间）
-            best_point = None
-            best_time = float('inf')
-            
+
+            best_option = None
+
             for point in self.loading_points:
                 # 检查车辆装货点限制
                 restricted_points = self.vehicle_point_restrictions.get(vehicle_id, set())
                 if point.id in restricted_points:
                     continue
-                
-                # 计算基础时间
-                distance = self.distance_matrix.get(vehicle_id, {}).get(point.name, 0)
-                prep_time = self.prep_time_matrix.get(vehicle_id, {}).get(point.name, 0)
-                travel_time = (distance / vehicle_speed) * 60 if vehicle_speed > 0 else 0
-                
-                # 计算预期排队时间（基于已分配到该点的车辆）
-                expected_queue_time = self._estimate_queue_time(
-                    point.id, travel_time, vehicle_schedules
+
+                candidate_schedule = self._create_schedule(
+                    vehicle_id,
+                    goods_ids,
+                    point,
+                    vehicle_speed
                 )
-                
-                # 总时间 = 行驶 + 准备 + 预期排队 + 装货
-                total_time = travel_time + prep_time + expected_queue_time + total_loading_time
-                
-                if total_time < best_time:
-                    best_time = total_time
-                    best_point = {
-                        'point': point,
-                        'distance': distance,
-                        'prep_time': prep_time,
-                        'expected_queue': expected_queue_time
+
+                queue_time, total_time = self._simulate_point_assignment(
+                    candidate_schedule,
+                    vehicle_schedules
+                )
+
+                if best_option is None or total_time < best_option['total_time']:
+                    best_option = {
+                        'schedule': candidate_schedule,
+                        'queue_time': queue_time,
+                        'total_time': total_time
                     }
-            
-            if best_point is None:
+
+            if best_option is None:
                 print(f"警告: 车辆 {vehicle_id} 无可用装货点")
                 continue
-            
-            # 创建车辆装货计划
-            schedule = VehicleSchedule(
-                vehicle_id, 
-                best_point['point'].id,
-                best_point['point'].name,
-                vehicle_speed
-            )
-            schedule.set_distance_and_prep(best_point['distance'], best_point['prep_time'])
-            
-            # 添加货物
-            for good_id in goods_ids:
-                good_info = self.goods_info.get(good_id, {})
-                good_name = good_info.get("name", good_id)
-                loading_time = self.goods_loading_time.get(good_id, 0)
-                schedule.add_good(good_id, good_name, loading_time)
-            
+
+            schedule = best_option['schedule']
+            schedule.set_queue_time(best_option['queue_time'])
             vehicle_schedules.append(schedule)
-        
+
         print(f"✓ 装货点分配完成")
         print(f"  - 车辆数: {len(vehicle_schedules)} 辆")
-        
+
         # 统计装货点使用情况
         point_usage = {}
         for schedule in vehicle_schedules:
             point_id = schedule.loading_point_id
             point_usage[point_id] = point_usage.get(point_id, 0) + 1
-        
+
         print(f"  - 使用装货点: {len(point_usage)} 个")
         print(f"  - 平均每个装货点服务: {len(vehicle_schedules) / len(point_usage):.1f} 辆车")
-        
+
         # 第二步：计算排队时长
         print("\n正在计算排队时长...")
         vehicle_schedules = self._calculate_queue_times(vehicle_schedules)
@@ -197,37 +174,61 @@ class LoadingTimeOptimizerV3:
         
         return vehicle_schedules, statistics
     
-    def _estimate_queue_time(self, point_id: str, arrival_time: float, 
-                            existing_schedules: List[VehicleSchedule]) -> float:
-        """
-        估算在某个装货点的预期排队时间
-        基于已分配到该点的车辆
-        """
-        # 找出已分配到该装货点的车辆
-        point_vehicles = [s for s in existing_schedules if s.loading_point_id == point_id]
-        
-        if not point_vehicles:
-            return 0.0  # 没有其他车，无需排队
-        
-        # 按到达时间排序
-        point_vehicles.sort(key=lambda s: s.travel_time)
-        
-        # 计算装货点何时可用
+    def _clone_schedule(self, schedule: VehicleSchedule) -> VehicleSchedule:
+        """创建车辆计划的深拷贝"""
+        cloned = VehicleSchedule(
+            schedule.vehicle_id,
+            schedule.loading_point_id,
+            schedule.loading_point_name,
+            schedule.vehicle_speed
+        )
+        cloned.set_distance_and_prep(schedule.distance, schedule.prep_time)
+        for good in schedule.goods:
+            cloned.add_good(good["货物ID"], good["货物名称"], good["装货时间"])
+        cloned.set_queue_time(schedule.queue_time)
+        return cloned
+
+    def _create_schedule(self, vehicle_id: str, goods_ids: List[str],
+                         point: LoadingPoint, vehicle_speed: float) -> VehicleSchedule:
+        """构建指定车辆在某装货点的计划（不含排队）"""
+        schedule = VehicleSchedule(vehicle_id, point.id, point.name, vehicle_speed)
+        distance = self.distance_matrix.get(vehicle_id, {}).get(point.name, 0)
+        prep_time = self.prep_time_matrix.get(vehicle_id, {}).get(point.name, 0)
+        schedule.set_distance_and_prep(distance, prep_time)
+
+        for good_id in goods_ids:
+            good_info = self.goods_info.get(good_id, {})
+            good_name = good_info.get("name", good_id)
+            loading_time = self.goods_loading_time.get(good_id, 0)
+            schedule.add_good(good_id, good_name, loading_time)
+
+        return schedule
+
+    def _simulate_point_assignment(self, candidate_schedule: VehicleSchedule,
+                                   existing_schedules: List[VehicleSchedule]) -> Tuple[float, float]:
+        """模拟候选计划加入装货点后的排队情况"""
+        point_id = candidate_schedule.loading_point_id
+        simulated_list = [
+            self._clone_schedule(s)
+            for s in existing_schedules
+            if s.loading_point_id == point_id
+        ]
+
+        simulated_candidate = self._clone_schedule(candidate_schedule)
+        simulated_list.append(simulated_candidate)
+
+        simulated_list.sort(key=lambda s: s.travel_time)
+
         point_available_time = 0.0
-        for pv in point_vehicles:
-            if pv.travel_time >= point_available_time:
-                # 该车到达时装货点已空闲
-                point_available_time = pv.travel_time + pv.prep_time + pv.loading_time
-            else:
-                # 该车需要排队
-                point_available_time = point_available_time + pv.prep_time + pv.loading_time
-        
-        # 当前车到达时的排队情况
-        if arrival_time >= point_available_time:
-            return 0.0  # 到达时已空闲
-        else:
-            return point_available_time - arrival_time  # 需要等待
-    
+        for schedule in simulated_list:
+            arrival = schedule.travel_time
+            start_time = max(arrival, point_available_time)
+            queue_time = max(0.0, start_time - arrival)
+            schedule.set_queue_time(queue_time)
+            point_available_time = start_time + schedule.prep_time + schedule.loading_time
+
+        return simulated_candidate.queue_time, simulated_candidate.total_time
+
     def _calculate_queue_times(self, schedules: List[VehicleSchedule]) -> List[VehicleSchedule]:
         """
         计算排队时长
@@ -243,33 +244,16 @@ class LoadingTimeOptimizerV3:
         
         # 为每个装货点计算排队时长
         for point_id, point_schedule_list in point_schedules.items():
-            if len(point_schedule_list) <= 1:
-                # 只有一辆车，无需排队
-                continue
-            
-            # 按到达时间（行驶时间）排序
             point_schedule_list.sort(key=lambda s: s.travel_time)
-            
-            # 第一辆车无需排队
-            point_schedule_list[0].set_queue_time(0)
-            
-            # 计算后续车辆的排队时间
-            cumulative_time = point_schedule_list[0].travel_time + point_schedule_list[0].prep_time + point_schedule_list[0].loading_time
-            
-            for i in range(1, len(point_schedule_list)):
-                current = point_schedule_list[i]
-                arrival_time = current.travel_time
-                
-                if arrival_time < cumulative_time:
-                    # 需要排队
-                    queue_time = cumulative_time - arrival_time
-                    current.set_queue_time(queue_time)
-                    cumulative_time = cumulative_time + current.prep_time + current.loading_time
-                else:
-                    # 无需排队
-                    current.set_queue_time(0)
-                    cumulative_time = arrival_time + current.prep_time + current.loading_time
-        
+
+            point_available_time = 0.0
+            for schedule in point_schedule_list:
+                arrival = schedule.travel_time
+                start_time = max(arrival, point_available_time)
+                queue_time = max(0.0, start_time - arrival)
+                schedule.set_queue_time(queue_time)
+                point_available_time = start_time + schedule.prep_time + schedule.loading_time
+
         return schedules
     
     def _balance_load(self, schedules: List[VehicleSchedule]) -> List[VehicleSchedule]:
@@ -277,61 +261,66 @@ class LoadingTimeOptimizerV3:
         负载均衡优化
         尝试将时间最长的车辆调整到其他装货点
         """
+        if not schedules:
+            return schedules
+
         max_iterations = 10
-        
-        for iteration in range(max_iterations):
-            # 找到耗时最长的车辆
-            max_schedule = max(schedules, key=lambda s: s.total_time)
-            max_time_before = max_schedule.total_time
-            
-            # 尝试为该车选择其他装货点
-            best_alternative = None
-            best_alternative_time = max_time_before
-            
-            for point in self.loading_points:
-                # 跳过当前装货点
-                if point.id == max_schedule.loading_point_id:
+
+        # 初始统一计算一次排队
+        schedules = self._calculate_queue_times(schedules)
+
+        for _ in range(max_iterations):
+            current_max = max(s.total_time for s in schedules)
+            improved = False
+
+            # 优先尝试改善耗时最长的车辆
+            for schedule in sorted(schedules, key=lambda s: s.total_time, reverse=True):
+                goods_ids = [g["货物ID"] for g in schedule.goods]
+                if not goods_ids:
                     continue
-                
-                # 检查限制
-                restricted_points = self.vehicle_point_restrictions.get(max_schedule.vehicle_id, set())
-                if point.id in restricted_points:
-                    continue
-                
-                # 计算在新装货点的时间
-                distance = self.distance_matrix.get(max_schedule.vehicle_id, {}).get(point.name, 0)
-                prep_time = self.prep_time_matrix.get(max_schedule.vehicle_id, {}).get(point.name, 0)
-                travel_time = (distance / max_schedule.vehicle_speed) * 60 if max_schedule.vehicle_speed > 0 else 0
-                
-                # 估算排队时间（假设该点当前的车辆都先到）
-                estimated_queue = 0
-                for other in schedules:
-                    if other.loading_point_id == point.id and other.vehicle_id != max_schedule.vehicle_id:
-                        if other.travel_time <= travel_time:
-                            estimated_queue += other.prep_time + other.loading_time
-                
-                total_time = travel_time + prep_time + estimated_queue + max_schedule.loading_time
-                
-                if total_time < best_alternative_time:
-                    best_alternative_time = total_time
-                    best_alternative = {
-                        'point': point,
-                        'distance': distance,
-                        'prep_time': prep_time
-                    }
-            
-            # 如果找到更好的装货点，则切换
-            if best_alternative and best_alternative_time < max_time_before * 0.95:  # 至少改善5%
-                max_schedule.loading_point_id = best_alternative['point'].id
-                max_schedule.loading_point_name = best_alternative['point'].name
-                max_schedule.set_distance_and_prep(best_alternative['distance'], best_alternative['prep_time'])
-                
-                # 重新计算排队时间
-                schedules = self._calculate_queue_times(schedules)
-            else:
-                # 无法改善，退出
+
+                restricted_points = self.vehicle_point_restrictions.get(schedule.vehicle_id, set())
+                best_candidate = None
+
+                for point in self.loading_points:
+                    if point.id == schedule.loading_point_id or point.id in restricted_points:
+                        continue
+
+                    candidate_schedule = self._create_schedule(
+                        schedule.vehicle_id,
+                        goods_ids,
+                        point,
+                        schedule.vehicle_speed
+                    )
+
+                    simulated_schedules = [
+                        self._clone_schedule(s) for s in schedules if s.vehicle_id != schedule.vehicle_id
+                    ]
+                    simulated_schedules.append(self._clone_schedule(candidate_schedule))
+                    simulated_schedules = self._calculate_queue_times(simulated_schedules)
+
+                    if not simulated_schedules:
+                        continue
+
+                    simulated_max = max(s.total_time for s in simulated_schedules)
+
+                    if simulated_max + 1e-6 < current_max:
+                        if (best_candidate is None or simulated_max < best_candidate['max_time']):
+                            best_candidate = {
+                                'schedule': candidate_schedule,
+                                'max_time': simulated_max
+                            }
+
+                if best_candidate:
+                    original_index = schedules.index(schedule)
+                    schedules[original_index] = best_candidate['schedule']
+                    schedules = self._calculate_queue_times(schedules)
+                    improved = True
+                    break
+
+            if not improved:
                 break
-        
+
         return schedules
     
     def _generate_statistics(self, schedules: List[VehicleSchedule]) -> Dict:

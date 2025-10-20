@@ -97,9 +97,8 @@ class LoadingOptimizer:
         优化装载方案
         返回: (使用的车辆列表, 未装载的货物列表)
         """
-        # 按容量降序排序车辆（优先使用大车）
-        # sorted_vehicles = sorted(self.vehicles, key=lambda v: -v.capacity)
-        sorted_vehicles = self.vehicles
+        # 按容量降序、速度降序排序车辆（优先选择装载能力大且速度快的车辆）
+        sorted_vehicles = sorted(self.vehicles, key=lambda v: (-v.capacity, -v.speed))
 
         # 按体积降序排序货物（先装大件）
         sorted_goods = sorted(self.goods, key=lambda g: -g.volume)
