@@ -6,13 +6,47 @@ import pandas as pd
 from vehicle_loading_optimizer import Vehicle, Good, LoadingOptimizer
 from loading_time_optimizer_v3 import LoadingPoint, LoadingTimeOptimizerV3, VehicleSchedule
 from datetime import datetime
+from pathlib import Path
 import os
 import sys
+
+# ===================== Excel 输入路径设置 =====================
+# 请在此处填写 Excel 文件的绝对路径，例如：
+# INPUT_EXCEL_PATH = r"D:\\data\\车辆货物数据.xlsx"
+# 如果留空，程序会在当前目录下自动查找默认文件名。
+INPUT_EXCEL_PATH = r""
+
+# 默认查找的 Excel 文件名，可根据需要调整。
+DEFAULT_INPUT_FILENAMES = [
+    "车辆货物数据.xlsx",
+    "车辆货物数据1.xlsx"
+]
+# ==============================================================
 
 # 设置输出编码
 if sys.platform == 'win32':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+
+def resolve_input_path() -> str:
+    """解析 Excel 输入路径，优先使用用户配置的绝对路径"""
+    if INPUT_EXCEL_PATH and INPUT_EXCEL_PATH.strip():
+        configured_path = Path(INPUT_EXCEL_PATH.strip()).expanduser()
+        # 如果用户输入的是相对路径，则转换为绝对路径以避免歧义
+        if not configured_path.is_absolute():
+            configured_path = configured_path.resolve()
+        return str(configured_path)
+
+    # 未配置时，在脚本所在目录查找默认文件
+    script_dir = Path(__file__).resolve().parent
+    for filename in DEFAULT_INPUT_FILENAMES:
+        candidate = script_dir / filename
+        if candidate.exists():
+            return str(candidate)
+
+    # 如果都找不到，则返回第一个默认路径（用于后续的错误提示）
+    return str(script_dir / DEFAULT_INPUT_FILENAMES[0])
 
 
 def load_data_from_excel(filename: str):
@@ -27,6 +61,15 @@ def load_data_from_excel(filename: str):
     df_distance = pd.read_excel(filename, sheet_name='车辆到装货点距离')
     df_prep_time = pd.read_excel(filename, sheet_name='车辆准备时长')
     df_loading_time = pd.read_excel(filename, sheet_name='货物装货时间')
+
+    # 校验“货物装货时间”表的列头是否为 ABC -> 货物ID, 货物名称, 装货时间(分钟)
+    required_loading_columns = ['货物ID', '货物名称', '装货时间(分钟)']
+    missing_columns = [col for col in required_loading_columns if col not in df_loading_time.columns]
+    if missing_columns:
+        raise ValueError(
+            f"'货物装货时间' 工作表缺少以下列: {', '.join(missing_columns)}。"
+            "请确保Excel表格的A、B、C列分别为：货物ID、货物名称、装货时间(分钟)。"
+        )
     
     # 创建车辆对象
     vehicles = []
@@ -333,12 +376,13 @@ def main():
     print("="*60)
     
     # 输入文件名
-    input_file = "车辆货物数据1.xlsx"
+    input_file = resolve_input_path()
     
     # 检查文件是否存在
     if not os.path.exists(input_file):
         print(f"\n错误: 找不到输入文件 '{input_file}'")
-        print("请先运行 generate_sample_data.py 生成模拟数据")
+        print("请确认已在 INPUT_EXCEL_PATH 中填写正确的绝对路径，或在程序目录下提供默认文件。")
+        print("如需生成示例数据，请先运行 generate_sample_data.py。")
         return
     
     # 加载数据
